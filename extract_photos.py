@@ -24,11 +24,13 @@ REQUIREMENTS FOR WIFI:
 
 import argparse
 import asyncio
+import re
 import sqlite3
 from pathlib import Path
 
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.exceptions import NoDeviceConnectedError
+from pymobiledevice3.osu.os_utils import get_os_utils
 
 DEST = Path("iphone_extract")
 FAVS_DIR = DEST / "favourites"
@@ -117,12 +119,58 @@ async def extract(use_wifi):
               + (f" ({missing} not found)" if missing else ""))
 
 
+async def list_paired_devices():
+    """Print all paired devices and check which are currently reachable."""
+    from pymobiledevice3.usbmux import list_devices
+
+    record_path = get_os_utils().pair_record_path
+    if not record_path.exists():
+        print(f"No pairing record directory found at {record_path}")
+        return
+
+    udid_pattern = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{16}$")
+    paired = [f.stem for f in record_path.glob("*.plist") if udid_pattern.match(f.stem)]
+    if not paired:
+        print("No paired devices found.")
+        return
+
+    connected = {}
+    try:
+        for dev in await list_devices():
+            key = dev.serial.replace("-", "")
+            if key in connected:
+                connected[key].append(dev.connection_type)
+            else:
+                connected[key] = [dev.connection_type]
+    except Exception:
+        pass
+
+    print(f"Found {len(paired)} paired device(s):\n")
+    for udid in paired:
+        normalized = udid.replace("-", "")
+        types = connected.get(normalized)
+        if types:
+            status = ", ".join(f"reachable ({t})" for t in types)
+        else:
+            status = "not connected"
+        print(f"  UDID:   {udid}")
+        print(f"  Status: {status}")
+        print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Extract iPhone favourite photos.")
     parser.add_argument("--wifi", action="store_true",
                         help="connect wirelessly instead of USB "
                              "(requires one-time 'wifi-connections on' over USB)")
+    parser.add_argument("--list-paired", action="store_true",
+                        help="list all devices ever paired with this laptop (no device needed)")
     args = parser.parse_args()
+
+    if args.list_paired:
+        asyncio.run(list_paired_devices())
+        return
+
     asyncio.run(extract(args.wifi))
 
 
