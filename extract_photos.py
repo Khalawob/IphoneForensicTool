@@ -8,7 +8,9 @@ those files. Works over USB (default) or wirelessly (--wifi).
 ONE-TIME WIFI SETUP (do this once, over USB):
     python -m pymobiledevice3 lockdown pair               # if not already paired
     python -m pymobiledevice3 lockdown wifi-connections on # enable WiFi reachability
-
+    python -m pymobiledevice3 lockdown unpair #for unpairing
+    
+    
 USAGE
 -----
     python extract_photos.py            # over USB
@@ -24,8 +26,10 @@ REQUIREMENTS FOR WIFI:
 
 import argparse
 import asyncio
+import os
 import re
 import sqlite3
+import tempfile
 from pathlib import Path
 
 from pymobiledevice3.lockdown import create_using_usbmux
@@ -66,6 +70,49 @@ def get_favourite_paths(db_path):
         con.close()
 
 
+def get_favourite_details(db_path):
+    """Return list of dicts with directory, filename, date, and size for favourites."""
+    con = sqlite3.connect(db_path)
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info(ZASSET)").fetchall()}
+        size_col = next(
+            (c for c in ("ZFILESIZE", "ZADJUSTEDFILESIZE", "ZORIGINALFILESIZE")
+             if c in cols), None
+        )
+        select = "ZDIRECTORY, ZFILENAME, ZDATECREATED"
+        if size_col:
+            select += f", {size_col}"
+        rows = con.execute(
+            f"SELECT {select} FROM ZASSET WHERE ZHIDDEN = 1 "
+            "ORDER BY ZDATECREATED DESC"
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        print("schema differs on this iOS version:", e)
+        return []
+    finally:
+        con.close()
+
+    from datetime import datetime, timedelta
+    APPLE_EPOCH = datetime(2001, 1, 1)
+    results = []
+    for row in rows:
+        directory, filename, date_created = row[0], row[1], row[2]
+        file_size = row[3] if len(row) > 3 else None
+        if date_created is not None:
+            dt = APPLE_EPOCH + timedelta(seconds=date_created)
+            date_str = dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            date_str = "unknown"
+        size_mb = f"{(file_size or 0) / 1_048_576:.1f} MB" if file_size else "-- MB"
+        results.append({
+            "directory": directory,
+            "filename": filename,
+            "date": date_str,
+            "size": size_mb,
+        })
+    return results
+
+
 async def candidate_remote(afc, directory, filename):
     """Resolve the real AFC path (handles the 'DCIM/' prefix ambiguity)."""
     for remote in (f"/{directory}/{filename}", f"/DCIM/{directory}/{filename}"):
@@ -73,6 +120,105 @@ async def candidate_remote(afc, directory, filename):
         if await afc.exists(remote):
             return remote
     return None
+
+
+def format_listing(details):
+    """Print a numbered list of favourites with metadata."""
+    print(f"\n{'#':>4}  {'Filename':<40} {'Date':<18} {'Size':>8}")
+    print("  " + "-" * 72)
+    for i, item in enumerate(details, 1):
+        print(f"{i:>4}  {item['filename']:<40} {item['date']:<18} {item['size']:>8}")
+    print()
+
+
+def parse_selection(raw, total):
+    """Parse user input like '1,3,5-7' into a sorted list of 0-based indices."""
+    indices = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            lo, hi = int(lo.strip()), int(hi.strip())
+            indices.update(range(lo - 1, hi))
+        elif part.isdigit():
+            indices.add(int(part) - 1)
+    return sorted(i for i in indices if 0 <= i < total)
+
+
+async def preview(use_wifi):
+    from pymobiledevice3.services.afc import AfcService
+
+    lockdown = await connect(use_wifi)
+    print(f"connected to {lockdown.short_info.get('DeviceName', 'device')} "
+          f"({'WiFi' if use_wifi else 'USB'})")
+
+    DEST.mkdir(exist_ok=True)
+
+    async with AfcService(lockdown) as afc:
+        for name in ("Photos.sqlite", "Photos.sqlite-wal", "Photos.sqlite-shm"):
+            remote = f"/PhotoData/{name}"
+            if await afc.exists(remote):
+                await afc.pull(remote, str(DEST), ignore_errors=True)
+
+        db = DEST / "Photos.sqlite"
+        if not db.exists():
+            print("Photos.sqlite not found -- cannot determine favourites.")
+            return
+
+        details = get_favourite_details(db)
+        if not details:
+            print("No favourites found.")
+            return
+
+        format_listing(details)
+
+        while True:
+            sel = input("Enter photo numbers to preview (e.g. 1,3,5-7), "
+                        "'a' for all, or 'q' to quit: ").strip().lower()
+            if sel == "q":
+                return
+            if sel == "a":
+                chosen = list(range(len(details)))
+            else:
+                chosen = parse_selection(sel, len(details))
+            if not chosen:
+                print("No valid selection. Try again.")
+                continue
+
+            tmp_dir = tempfile.mkdtemp(prefix="iphone_preview_")
+            opened = []
+            for idx in chosen:
+                item = details[idx]
+                remote = await candidate_remote(afc, item["directory"], item["filename"])
+                if remote is None:
+                    print(f"  not found on device: {item['filename']}")
+                    continue
+                await afc.pull(remote, tmp_dir, ignore_errors=True)
+                local = Path(tmp_dir) / item["filename"]
+                if local.exists():
+                    os.startfile(str(local))
+                    opened.append(local)
+                    print(f"  opened: {item['filename']}")
+                else:
+                    print(f"  failed to pull: {item['filename']}")
+
+            if opened:
+                save = input("\nDownload these to disk? (y/n): ").strip().lower()
+                if save == "y":
+                    FAVS_DIR.mkdir(exist_ok=True)
+                    import shutil
+                    for f in opened:
+                        shutil.copy2(str(f), str(FAVS_DIR / f.name))
+                    print(f"Saved {len(opened)} file(s) to {FAVS_DIR}")
+
+            for f in Path(tmp_dir).iterdir():
+                f.unlink(missing_ok=True)
+            Path(tmp_dir).rmdir()
+
+            another = input("Preview more? (y/n): ").strip().lower()
+            if another != "y":
+                return
+            format_listing(details)
 
 
 async def extract(use_wifi):
@@ -163,12 +309,18 @@ def main():
     parser.add_argument("--wifi", action="store_true",
                         help="connect wirelessly instead of USB "
                              "(requires one-time 'wifi-connections on' over USB)")
+    parser.add_argument("--preview", action="store_true",
+                        help="browse and preview favourites without downloading")
     parser.add_argument("--list-paired", action="store_true",
                         help="list all devices ever paired with this laptop (no device needed)")
     args = parser.parse_args()
 
     if args.list_paired:
         asyncio.run(list_paired_devices())
+        return
+
+    if args.preview:
+        asyncio.run(preview(args.wifi))
         return
 
     asyncio.run(extract(args.wifi))
