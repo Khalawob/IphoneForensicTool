@@ -7,15 +7,20 @@ those files. Works over USB (default) or wirelessly (--wifi).
 
 ONE-TIME WIFI SETUP (do this once, over USB):
     python -m pymobiledevice3 lockdown pair               # if not already paired
-    python -m pymobiledevice3 lockdown wifi-connections on # enable WiFi reachability
-    python -m pymobiledevice3 lockdown unpair #for unpairing
-    
+    python -m pymobiledevice3 lockdown wifi-connections on # enable WiFi reachability          
     
 USAGE
 -----
     python extract_photos.py            # over USB
     python extract_photos.py --wifi     # over WiFi (after the setup above)
 
+    
+Other useful commands:
+    python -m pymobiledevice3 lockdown wifi-connections off # disable WiFi reachability
+    python -m pymobiledevice3 lockdown unpair #for unpairing
+    python -m pymobiledevice3 usbmux list # to see if the device is reachable over WiFi                          
+    python extract_photos.py --list-paired  
+    
 REQUIREMENTS FOR WIFI:
   * Phone and laptop on the SAME network/subnet (the protocol won't cross subnets).
   * Phone connected to WiFi and UNLOCKED (media files seal when the device locks).
