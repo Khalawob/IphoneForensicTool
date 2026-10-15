@@ -6,9 +6,12 @@ Pulls only the photo-library DB, finds favourited assets, then pulls just
 those files. Works over USB (default) or wirelessly (--wifi).
 
 ONE-TIME WIFI SETUP (do this once, over USB):
-    python -m pymobiledevice3 lockdown pair               # if not already paired
-    python -m pymobiledevice3 lockdown wifi-connections on # enable WiFi reachability          
-    
+    python extract_photos.py --setup-wifi
+
+    Or manually:
+        python -m pymobiledevice3 lockdown pair               # if not already paired
+        python -m pymobiledevice3 lockdown wifi-connections on # enable WiFi reachability
+
 USAGE
 -----
     python extract_photos.py            # over USB
@@ -270,6 +273,49 @@ async def extract(use_wifi):
               + (f" ({missing} not found)" if missing else ""))
 
 
+async def setup_wifi():
+    """Pair over USB and enable WiFi connections in one step."""
+    from pymobiledevice3.usbmux import list_devices
+
+    print("Connecting over USB...")
+    try:
+        lockdown = await create_using_usbmux(
+            connection_type="USB", autopair=True, pair_timeout=30
+        )
+    except NoDeviceConnectedError:
+        print("No device found over USB. Plug in your iPhone and try again.")
+        return
+
+    device_name = lockdown.short_info.get("DeviceName", "device")
+    print(f"Paired with {device_name}.")
+
+    print("Enabling WiFi connections...")
+    await lockdown.set_enable_wifi_connections(True)
+    print("WiFi connections enabled.")
+
+    udid = lockdown.short_info.get("UniqueDeviceID", "")
+    udid_norm = udid.replace("-", "")
+
+    print("Verifying network reachability", end="", flush=True)
+    for attempt in range(3):
+        await asyncio.sleep(2)
+        print(".", end="", flush=True)
+        try:
+            for dev in await list_devices():
+                if dev.serial.replace("-", "") == udid_norm and dev.connection_type == "Network":
+                    print(f"\n\nDone! {device_name} is reachable over WiFi.")
+                    print("You can now run:  python extract_photos.py --wifi")
+                    return
+        except Exception:
+            pass
+
+    print("\n\nWiFi connections enabled, but the device isn't showing up over "
+          "the network yet.")
+    print("This can take up to a minute. Verify with:")
+    print("  python -m pymobiledevice3 usbmux list")
+    print("Once it appears with ConnectionType: Network, you're good to go.")
+
+
 async def list_paired_devices():
     """Print all paired devices and check which are currently reachable."""
     from pymobiledevice3.usbmux import list_devices
@@ -316,9 +362,15 @@ def main():
                              "(requires one-time 'wifi-connections on' over USB)")
     parser.add_argument("--preview", action="store_true",
                         help="browse and preview favourites without downloading")
+    parser.add_argument("--setup-wifi", action="store_true",
+                        help="one-time setup: pair over USB and enable WiFi connections")
     parser.add_argument("--list-paired", action="store_true",
                         help="list all devices ever paired with this laptop (no device needed)")
     args = parser.parse_args()
+
+    if args.setup_wifi:
+        asyncio.run(setup_wifi())
+        return
 
     if args.list_paired:
         asyncio.run(list_paired_devices())
