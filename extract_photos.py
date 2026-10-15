@@ -286,18 +286,21 @@ async def setup_wifi():
         print("No device found over USB. Plug in your iPhone and try again.")
         return
 
-    device_name = lockdown.short_info.get("DeviceName", "device")
-    print(f"Paired with {device_name}.")
+    try:
+        device_name = lockdown.short_info.get("DeviceName", "device")
+        print(f"Paired with {device_name}.")
 
-    print("Enabling WiFi connections...")
-    await lockdown.set_enable_wifi_connections(True)
-    print("WiFi connections enabled.")
+        print("Enabling WiFi connections...")
+        await lockdown.set_enable_wifi_connections(True)
+        print("WiFi connections enabled.")
 
-    udid = lockdown.short_info.get("UniqueDeviceID", "")
-    udid_norm = udid.replace("-", "")
+        udid = lockdown.short_info.get("UniqueDeviceID", "")
+        udid_norm = udid.replace("-", "")
+    finally:
+        await lockdown.close()
 
     print("Verifying network reachability", end="", flush=True)
-    for attempt in range(3):
+    for _ in range(3):
         await asyncio.sleep(2)
         print(".", end="", flush=True)
         try:
