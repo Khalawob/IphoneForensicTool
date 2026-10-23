@@ -1,0 +1,5 @@
+# Extracted iPhone data — never commit, contains personal data and is large
+iphone_extract/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

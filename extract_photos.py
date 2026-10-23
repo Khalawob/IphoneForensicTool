@@ -22,7 +22,11 @@ Other useful commands:
     python -m pymobiledevice3 lockdown wifi-connections off # disable WiFi reachability
     python -m pymobiledevice3 lockdown unpair #for unpairing
     python -m pymobiledevice3 usbmux list # to see if the device is reachable over WiFi                          
-    python extract_photos.py --list-paired  
+    python extract_photos.py --list-paired
+    python extract_photos.py --list-albums      # album names on the device
+    python extract_photos.py --list-media-types # media types / utilities + counts
+    python extract_photos.py --media-type videos           # extract one collection
+    python extract_photos.py --preview --media-type screenshots
     
 REQUIREMENTS FOR WIFI:
   * Phone and laptop on the SAME network/subnet (the protocol won't cross subnets).
@@ -47,6 +51,157 @@ from pymobiledevice3.osu.os_utils import get_os_utils
 DEST = Path("iphone_extract")
 FAVS_DIR = DEST / "favourites"
 
+# Asset categories, mirroring the "Media Types" and "Utilities" sections of the
+# Photos app: key -> (label, columns it needs, SQL predicate over ZASSET).
+# A category whose columns are missing on a given iOS version is skipped rather
+# than erroring. The ZKINDSUBTYPE / ZPLAYBACKSTYLE numbers come from the
+# documented schema and have shifted between iOS releases, so
+# --list-media-types also prints the raw distribution to check them against.
+CATEGORIES = {
+    "photos":            ("Photos",            ("ZKIND",), "ZKIND = 0"),
+    "videos":            ("Videos",            ("ZKIND",), "ZKIND = 1"),
+    "live":              ("Live Photos",       ("ZPLAYBACKSTYLE",), "ZPLAYBACKSTYLE = 3"),
+    "animated":          ("Animated",          ("ZPLAYBACKSTYLE",), "ZPLAYBACKSTYLE = 2"),
+    "screenshots":       ("Screenshots",       ("ZKIND", "ZKINDSUBTYPE"),
+                          "ZKIND = 0 AND ZKINDSUBTYPE = 10"),
+    "screen-recordings": ("Screen Recordings", ("ZKIND", "ZKINDSUBTYPE"),
+                          "ZKIND = 1 AND ZKINDSUBTYPE = 10"),
+    "panoramas":         ("Panoramas",         ("ZKIND", "ZKINDSUBTYPE"),
+                          "ZKIND = 0 AND ZKINDSUBTYPE = 1"),
+    "slomo":             ("Slo-mo",            ("ZKIND", "ZKINDSUBTYPE"),
+                          "ZKIND = 1 AND ZKINDSUBTYPE = 2"),
+    "timelapse":         ("Time-lapse",        ("ZKIND", "ZKINDSUBTYPE"),
+                          "ZKIND = 1 AND ZKINDSUBTYPE = 100"),
+    "bursts":            ("Bursts",            ("ZAVALANCHEUUID",),
+                          "ZAVALANCHEUUID IS NOT NULL"),
+    "portrait":          ("Portrait",          ("ZDEPTHTYPE",), "ZDEPTHTYPE != 0"),
+    "favourites":        ("Favourites",        ("ZFAVORITE",), "ZFAVORITE = 1"),
+    "hidden":            ("Hidden",            ("ZHIDDEN",), "ZHIDDEN = 1"),
+    "deleted":           ("Recently Deleted",  ("ZTRASHEDSTATE",), "ZTRASHEDSTATE != 0"),
+    "imports":           ("Imports",           ("ZIMPORTSESSION",),
+                          "ZIMPORTSESSION IS NOT NULL"),
+    "duplicates":        ("Duplicates",        ("ZDUPLICATEASSETVISIBILITYSTATE",),
+                          "ZDUPLICATEASSETVISIBILITYSTATE != 0"),
+}
+
+MEDIA_TYPE_KEYS = ("photos", "videos", "live", "animated", "screenshots",
+                   "screen-recordings", "panoramas", "slomo", "timelapse",
+                   "bursts", "portrait")
+UTILITY_KEYS = ("favourites", "hidden", "deleted", "imports", "duplicates")
+
+# What the extractor pulls when no category is named (the original behaviour).
+DEFAULT_WHERE = "ZHIDDEN = 1"
+
+
+def asset_columns(db_path):
+    """Return the set of column names present on ZASSET."""
+    con = sqlite3.connect(db_path)
+    try:
+        return {row[1] for row in con.execute("PRAGMA table_info(ZASSET)")}
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        con.close()
+
+
+def category_where(key, cols):
+    """Build the WHERE clause for a category, or None if unsupported here.
+
+    Everything except 'deleted' excludes trashed assets, matching how the
+    Photos app scopes these collections.
+    """
+    label, needed, predicate = CATEGORIES[key]
+    if not all(c in cols for c in needed):
+        return None
+    if key != "deleted" and "ZTRASHEDSTATE" in cols:
+        return f"({predicate}) AND ZTRASHEDSTATE = 0"
+    return predicate
+
+
+def count_categories(db_path, keys):
+    """Return [(label, count_or_None), ...] for the given category keys."""
+    cols = asset_columns(db_path)
+    con = sqlite3.connect(db_path)
+    out = []
+    try:
+        for key in keys:
+            label = CATEGORIES[key][0]
+            where = category_where(key, cols)
+            if where is None:
+                out.append((key, label, None))
+                continue
+            try:
+                n = con.execute(f"SELECT COUNT(*) FROM ZASSET WHERE {where}").fetchone()[0]
+            except sqlite3.OperationalError:
+                n = None
+            out.append((key, label, n))
+    finally:
+        con.close()
+    return out
+
+
+def kind_distribution(db_path):
+    """Raw (ZKIND, ZKINDSUBTYPE, ZPLAYBACKSTYLE) counts, for checking the mapping."""
+    cols = asset_columns(db_path)
+    present = [c for c in ("ZKIND", "ZKINDSUBTYPE", "ZPLAYBACKSTYLE") if c in cols]
+    if not present:
+        return [], []
+    group = ", ".join(present)
+    con = sqlite3.connect(db_path)
+    try:
+        rows = con.execute(
+            f"SELECT {group}, COUNT(*) FROM ZASSET GROUP BY {group} "
+            "ORDER BY COUNT(*) DESC"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return [], []
+    finally:
+        con.close()
+    return present, rows
+
+
+def print_category_table(title, counted):
+    print(f"\n{title}")
+    print(f"{'Key':<20} {'Collection':<20} {'Count':>7}")
+    print("-" * 49)
+    for key, label, n in counted:
+        shown = "n/a" if n is None else str(n)
+        print(f"{key:<20} {label:<20} {shown:>7}")
+
+
+async def list_media_types(use_wifi):
+    """List media-type and utility collections with asset counts."""
+    from pymobiledevice3.services.afc import AfcService
+
+    lockdown = await connect(use_wifi)
+    print(f"connected to {lockdown.short_info.get('DeviceName', 'device')} "
+          f"({'WiFi' if use_wifi else 'USB'})")
+
+    async with AfcService(lockdown) as afc:
+        db = await pull_library_db(afc)
+        if db is None:
+            print("Photos.sqlite not found -- cannot read media types.")
+            return
+
+        if not asset_columns(db):
+            print("ZASSET not present -- schema differs on this iOS version.")
+            return
+
+        print_category_table("MEDIA TYPES", count_categories(db, MEDIA_TYPE_KEYS))
+        print_category_table("UTILITIES", count_categories(db, UTILITY_KEYS))
+
+        cols, rows = kind_distribution(db)
+        if rows:
+            print("\nRAW SUBTYPE DISTRIBUTION (to verify the mapping above)")
+            header = "  ".join(f"{c:>16}" for c in cols)
+            print(f"{header}  {'Count':>7}")
+            print("-" * (len(header) + 9))
+            for row in rows:
+                cells = "  ".join(f"{str(v):>16}" for v in row[:-1])
+                print(f"{cells}  {row[-1]:>7}")
+        print("\n'n/a' means this iOS version's schema lacks the needed column.")
+        print("Target one with:  python extract_photos.py --media-type <key>\n")
+
 
 async def connect(use_wifi):
     """Open a lockdown connection over WiFi ('Network') or USB."""
@@ -64,12 +219,12 @@ async def connect(use_wifi):
         raise
 
 
-def get_favourite_paths(db_path):
-    """Return [(ZDIRECTORY, ZFILENAME), ...] for every favourited asset."""
+def get_asset_paths(db_path, where=DEFAULT_WHERE):
+    """Return [(ZDIRECTORY, ZFILENAME), ...] for every asset matching 'where'."""
     con = sqlite3.connect(db_path)
     try:
         return con.execute(
-            "SELECT ZDIRECTORY, ZFILENAME FROM ZASSET WHERE ZHIDDEN = 1"
+            f"SELECT ZDIRECTORY, ZFILENAME FROM ZASSET WHERE {where}"
         ).fetchall()
     except sqlite3.OperationalError as e:
         print("schema differs on this iOS version:", e)
@@ -78,8 +233,8 @@ def get_favourite_paths(db_path):
         con.close()
 
 
-def get_favourite_details(db_path):
-    """Return list of dicts with directory, filename, date, and size for favourites."""
+def get_asset_details(db_path, where=DEFAULT_WHERE):
+    """Return dicts with directory, filename, date and size for matching assets."""
     con = sqlite3.connect(db_path)
     try:
         cols = {row[1] for row in con.execute("PRAGMA table_info(ZASSET)").fetchall()}
@@ -91,7 +246,7 @@ def get_favourite_details(db_path):
         if size_col:
             select += f", {size_col}"
         rows = con.execute(
-            f"SELECT {select} FROM ZASSET WHERE ZHIDDEN = 1 "
+            f"SELECT {select} FROM ZASSET WHERE {where} "
             "ORDER BY ZDATECREATED DESC"
         ).fetchall()
     except sqlite3.OperationalError as e:
@@ -153,30 +308,43 @@ def parse_selection(raw, total):
     return sorted(i for i in indices if 0 <= i < total)
 
 
-async def preview(use_wifi):
+def resolve_category(db, category):
+    """Return (where, label, out_dir) for a category key, or None if unusable."""
+    if category is None:
+        return DEFAULT_WHERE, "favourites", FAVS_DIR
+    cols = asset_columns(db)
+    where = category_where(category, cols)
+    if where is None:
+        label = CATEGORIES[category][0]
+        print(f"'{label}' is not available on this iOS version "
+              f"(needs {', '.join(CATEGORIES[category][1])}).")
+        return None
+    return where, CATEGORIES[category][0], DEST / category
+
+
+async def preview(use_wifi, category=None):
     from pymobiledevice3.services.afc import AfcService
 
     lockdown = await connect(use_wifi)
     print(f"connected to {lockdown.short_info.get('DeviceName', 'device')} "
           f"({'WiFi' if use_wifi else 'USB'})")
 
-    DEST.mkdir(exist_ok=True)
-
     async with AfcService(lockdown) as afc:
-        for name in ("Photos.sqlite", "Photos.sqlite-wal", "Photos.sqlite-shm"):
-            remote = f"/PhotoData/{name}"
-            if await afc.exists(remote):
-                await afc.pull(remote, str(DEST), ignore_errors=True)
-
-        db = DEST / "Photos.sqlite"
-        if not db.exists():
+        db = await pull_library_db(afc)
+        if db is None:
             print("Photos.sqlite not found -- cannot determine favourites.")
             return
 
-        details = get_favourite_details(db)
-        if not details:
-            print("No favourites found.")
+        resolved = resolve_category(db, category)
+        if resolved is None:
             return
+        where, label, out_dir = resolved
+
+        details = get_asset_details(db, where)
+        if not details:
+            print(f"No {label.lower()} found.")
+            return
+        print(f"{len(details)} {label.lower()} in the library.")
 
         format_listing(details)
 
@@ -213,11 +381,11 @@ async def preview(use_wifi):
             if opened:
                 save = input("\nDownload these to disk? (y/n): ").strip().lower()
                 if save == "y":
-                    FAVS_DIR.mkdir(exist_ok=True)
+                    out_dir.mkdir(parents=True, exist_ok=True)
                     import shutil
                     for f in opened:
-                        shutil.copy2(str(f), str(FAVS_DIR / f.name))
-                    print(f"Saved {len(opened)} file(s) to {FAVS_DIR}")
+                        shutil.copy2(str(f), str(out_dir / f.name))
+                    print(f"Saved {len(opened)} file(s) to {out_dir}")
 
             for f in Path(tmp_dir).iterdir():
                 f.unlink(missing_ok=True)
@@ -229,7 +397,7 @@ async def preview(use_wifi):
             format_listing(details)
 
 
-async def extract(use_wifi):
+async def extract(use_wifi, category=None):
     # Import here so the module loads even if AFC internals shift.
     from pymobiledevice3.services.afc import AfcService
 
@@ -237,28 +405,26 @@ async def extract(use_wifi):
     print(f"connected to {lockdown.short_info.get('DeviceName', 'device')} "
           f"({'WiFi' if use_wifi else 'USB'})")
 
-    DEST.mkdir(exist_ok=True)
-
     async with AfcService(lockdown) as afc:
         # 1. Pull only the DB (+ WAL sidecars).
-        for name in ("Photos.sqlite", "Photos.sqlite-wal", "Photos.sqlite-shm"):
-            remote = f"/PhotoData/{name}"
-            if await afc.exists(remote):
-                await afc.pull(remote, str(DEST), ignore_errors=True)
-
-        db = DEST / "Photos.sqlite"
-        if not db.exists():
+        db = await pull_library_db(afc)
+        if db is None:
             print("Photos.sqlite not found -- cannot determine favourites.")
             return
 
-        # 2. Find favourites.
-        favs = get_favourite_paths(db)
-        print(f"{len(favs)} favourites recorded in the library.")
+        # 2. Find the assets to pull.
+        resolved = resolve_category(db, category)
+        if resolved is None:
+            return
+        where, label, out_dir = resolved
+
+        favs = get_asset_paths(db, where)
+        print(f"{len(favs)} {label.lower()} recorded in the library.")
         if not favs:
             return
 
         # 3. Pull only those files.
-        FAVS_DIR.mkdir(exist_ok=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
         pulled, missing = 0, 0
         for directory, filename in favs:
             remote = await candidate_remote(afc, directory, filename)
@@ -266,11 +432,118 @@ async def extract(use_wifi):
                 missing += 1
                 print(f"  not found on device: {directory}/{filename}")
                 continue
-            await afc.pull(remote, str(FAVS_DIR), ignore_errors=True)
+            await afc.pull(remote, str(out_dir), ignore_errors=True)
             pulled += 1
 
-        print(f"\npulled {pulled} favourites into {FAVS_DIR}"
+        print(f"\npulled {pulled} {label.lower()} into {out_dir}"
               + (f" ({missing} not found)" if missing else ""))
+
+
+# Album kinds seen in ZGENERICALBUM; anything else is printed as its raw number.
+ALBUM_KINDS = {2: "album", 1500: "folder", 1505: "folder"}
+
+
+def get_albums(db_path):
+    """Return [{title, kind, count}, ...] for every named album in the library.
+
+    Asset counts come from the album<->asset join table, whose name carries a
+    version-specific number (Z_28ASSETS, Z_30ASSETS, ...), so it is discovered
+    at runtime. If it cannot be found, a cached count column is used instead.
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info(ZGENERICALBUM)")}
+        if not cols:
+            print("ZGENERICALBUM not present -- schema differs on this iOS version.")
+            return []
+
+        join = next(
+            (name for (name,) in con.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name LIKE 'Z!_%ASSETS' ESCAPE '!'"
+            ) if re.fullmatch(r"Z_\d+ASSETS", name)),
+            None,
+        )
+        album_col = asset_col = None
+        if join:
+            join_cols = [row[1] for row in con.execute(f"PRAGMA table_info({join})")]
+            album_col = next((c for c in join_cols if "ALBUM" in c), None)
+            asset_col = next((c for c in join_cols if "ASSET" in c), None)
+
+        kind = "ZKIND" if "ZKIND" in cols else None
+
+        if join and album_col and asset_col:
+            rows = con.execute(
+                f"SELECT a.ZTITLE, {f'a.{kind}' if kind else 'NULL'}, "
+                f"COUNT(j.{asset_col}) "
+                f"FROM ZGENERICALBUM a "
+                f"LEFT JOIN {join} j ON j.{album_col} = a.Z_PK "
+                "WHERE a.ZTITLE IS NOT NULL AND a.ZTITLE != '' "
+                "GROUP BY a.Z_PK ORDER BY a.ZTITLE COLLATE NOCASE"
+            ).fetchall()
+        else:
+            cached = next(
+                (c for c in ("ZCACHEDCOUNT", "ZCACHEDPHOTOSCOUNT") if c in cols), None
+            )
+            rows = con.execute(
+                f"SELECT ZTITLE, {kind or 'NULL'}, {cached or 'NULL'} "
+                "FROM ZGENERICALBUM "
+                "WHERE ZTITLE IS NOT NULL AND ZTITLE != '' "
+                "ORDER BY ZTITLE COLLATE NOCASE"
+            ).fetchall()
+    except sqlite3.OperationalError as e:
+        print("schema differs on this iOS version:", e)
+        return []
+    finally:
+        con.close()
+
+    return [
+        {
+            "title": title,
+            "kind": ALBUM_KINDS.get(kind_val, str(kind_val) if kind_val is not None else "-"),
+            "count": count,
+        }
+        for title, kind_val, count in rows
+    ]
+
+
+async def pull_library_db(afc):
+    """Pull Photos.sqlite (+ WAL sidecars) into DEST; return the DB path or None."""
+    DEST.mkdir(exist_ok=True)
+    for name in ("Photos.sqlite", "Photos.sqlite-wal", "Photos.sqlite-shm"):
+        remote = f"/PhotoData/{name}"
+        if await afc.exists(remote):
+            await afc.pull(remote, str(DEST), ignore_errors=True)
+    db = DEST / "Photos.sqlite"
+    return db if db.exists() else None
+
+
+async def list_albums(use_wifi):
+    """List the album names on the device with their photo counts."""
+    from pymobiledevice3.services.afc import AfcService
+
+    lockdown = await connect(use_wifi)
+    print(f"connected to {lockdown.short_info.get('DeviceName', 'device')} "
+          f"({'WiFi' if use_wifi else 'USB'})")
+
+    async with AfcService(lockdown) as afc:
+        db = await pull_library_db(afc)
+        if db is None:
+            print("Photos.sqlite not found -- cannot read albums.")
+            return
+
+        albums = get_albums(db)
+        if not albums:
+            print("No albums found.")
+            return
+
+        print(f"\n{'Album':<40} {'Kind':<10} {'Photos':>7}")
+        print("-" * 59)
+        for a in albums:
+            count = "-" if a["count"] is None else str(a["count"])
+            print(f"{a['title'][:40]:<40} {a['kind']:<10} {count:>7}")
+        print("-" * 59)
+        print(f"{len(albums)} album(s)\n")
 
 
 async def setup_wifi():
@@ -377,6 +650,13 @@ def main():
                         help="one-time setup: pair over USB and enable WiFi connections")
     parser.add_argument("--list-paired", action="store_true",
                         help="list all devices ever paired with this laptop (no device needed)")
+    parser.add_argument("--list-albums", action="store_true",
+                        help="list the album names on the device with photo counts")
+    parser.add_argument("--list-media-types", action="store_true",
+                        help="list media-type and utility collections with counts")
+    parser.add_argument("--media-type", metavar="KEY", choices=sorted(CATEGORIES),
+                        help="target one collection instead of the default set; "
+                             "keys: " + ", ".join(sorted(CATEGORIES)))
     args = parser.parse_args()
 
     if args.setup_wifi:
@@ -387,11 +667,19 @@ def main():
         asyncio.run(list_paired_devices())
         return
 
-    if args.preview:
-        asyncio.run(preview(args.wifi))
+    if args.list_albums:
+        asyncio.run(list_albums(args.wifi))
         return
 
-    asyncio.run(extract(args.wifi))
+    if args.list_media_types:
+        asyncio.run(list_media_types(args.wifi))
+        return
+
+    if args.preview:
+        asyncio.run(preview(args.wifi, args.media_type))
+        return
+
+    asyncio.run(extract(args.wifi, args.media_type))
 
 
 if __name__ == "__main__":
