@@ -58,9 +58,13 @@ Queries take a `where` string rather than a category or a filter object
 `(where, label, out_dir)` triple that the read and write paths both consume, so
 `preview()` and `extract()` share identical selection semantics.
 
-Note the default: with no `--media-type`, `DEFAULT_WHERE`
-(`extract_photos.py:93`) is used and the output is labelled/stored as
-`favourites`.
+Note the default: with no `--media-type`, `resolve_category()` substitutes
+`DEFAULT_CATEGORY` (`"favourites"`) and resolves it like any named key, so the
+output is labelled/stored as `favourites`. It is a *key*, not a predicate, on
+purpose — returning the bare `DEFAULT_WHERE` bypassed `category_where()` and
+therefore its `ZTRASHEDSTATE = 0` guard, so the default run pulled favourites
+sitting in Recently Deleted (trashing an asset leaves `ZFAVORITE = 1`). Any
+new default must go through `category_where()` for the same reason.
 
 ## 4. Command dispatch in `main()`
 

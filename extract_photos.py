@@ -127,8 +127,16 @@ MEDIA_TYPE_KEYS = ("photos", "videos", "live", "animated", "screenshots",
                    "bursts", "portrait")
 UTILITY_KEYS = ("favourites", "hidden", "deleted", "imports", "duplicates")
 
-# What the extractor pulls when no category is named (the original behaviour).
-DEFAULT_WHERE = "ZFAVORITE = 1"
+# What the extractor pulls when no category is named. It is a CATEGORIES key,
+# not a bare predicate, so that the default run gets the same treatment as a
+# named one -- notably the ZTRASHEDSTATE = 0 guard category_where() adds. A
+# raw "ZFAVORITE = 1" here silently included favourites sitting in Recently
+# Deleted, which keep their favourite flag when trashed.
+DEFAULT_CATEGORY = "favourites"
+
+# The predicate behind that key, for the query helpers' default argument and
+# as the fallback if the key cannot be resolved against this library.
+DEFAULT_WHERE = CATEGORIES[DEFAULT_CATEGORY][2]
 
 
 def open_db(db_path):
@@ -410,9 +418,14 @@ def parse_selection(raw, total):
 
 
 def resolve_category(db, category):
-    """Return (where, label, out_dir) for a category key, or None if unusable."""
+    """Return (where, label, out_dir) for a category key, or None if unusable.
+
+    A missing category means DEFAULT_CATEGORY, resolved through exactly the
+    same path as a named one: the default used to bypass category_where() and
+    so pulled trashed favourites, which is not what the Photos app shows.
+    """
     if category is None:
-        return DEFAULT_WHERE, "favourites", FAVS_DIR
+        category = DEFAULT_CATEGORY
     cols = asset_columns(db)
     where = category_where(category, cols)
     if where is None:
