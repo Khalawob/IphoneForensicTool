@@ -2,7 +2,7 @@
 """Build a page-selective local copy of a remote SQLite database.
 
 The iPhone photo library's Photos.sqlite runs to ~129MB, but the queries this
-tool makes touch under 5% of it: the bulk of the file is ACHANGE,
+tool makes touch about a ninth of it: the bulk of the file is ACHANGE,
 ZSCENECLASSIFICATION and ATRANSACTION, which are never read. Pulling the whole
 file costs ~34s over WiFi at the measured ~3.8MB/s.
 
@@ -24,23 +24,31 @@ to pick any index it likes, because they are all present.
 
 Measured on a real 2,972-asset library (page_size 4096, 32,958 pages):
 
-    page 1 + sqlite_master      37 pages
-    ZASSET table               414 pages
-    ZASSET indexes (91)      1,028 pages
-    ZGENERICALBUM + joins      109 pages
-    ------------------------------------
-    total                    1,588 pages = 6.2MB = 4.8% of 128.7MB
+    page 1 + sqlite_master          37 pages
+    ZASSET table                   414 pages
+    ZASSET indexes (91)          1,028 pages
+    ZADDITIONALASSETATTRIBUTES   1,950 pages
+    its indexes (23)               230 pages
+    ZGENERICALBUM + joins          109 pages
+    ----------------------------------------
+    total                        3,768 pages = 15.4MB = 11.4% of 135.0MB
 
-Those pages are scattered over 964 runs, so one ranged read per run would cost
-964 round trips. READ_GAP_PAGES bridges small holes to trade wasted bytes for
-round trips; the measured curve on that library is:
+ZADDITIONALASSETATTRIBUTES is more than half of that, and it is there for one
+column: the byte size extract() compares a local copy against before spending
+a transfer (see asset_size_select in extract_photos.py). Dropping it would
+return the copy to ~6MB, at the price of two AFC round trips per asset the
+run could otherwise have skipped untouched.
+
+Those pages are scattered over 1,860 runs, so one ranged read per run would
+cost 1,860 round trips. READ_GAP_PAGES bridges small holes to trade wasted
+bytes for round trips; the measured curve on that library is:
 
     gap    reads   fetched
-      0      964     6.2MB
-      4      688     8.6MB
-      8      574    11.4MB      <- the default
-     16      454    17.3MB
-     64      155    60.9MB
+      0     2035    15.4MB
+      4     1457    19.5MB
+      8     1215    24.5MB      <- the default
+     16      914    36.2MB
+     64      268    89.3MB
 
 Nothing here assumes the Photos schema. It is a plain SQLite file-format
 reader, and it treats the remote file as untrusted: anything structurally
@@ -271,7 +279,7 @@ async def btree_pages(store, roots, reserved):
     then puts hundreds of scattered page numbers in front of the coalescer at
     the same time instead of a dozen. On the measured library that is the
     difference between 1,431 round trips and 577 for the same pages -- walking
-    the 140 b-trees one after another gives coalesce() almost nothing to work
+    the 164 b-trees one after another gives coalesce() almost nothing to work
     with.
     """
     usable = store.page_size - reserved
@@ -345,7 +353,16 @@ async def _overflow_pages(store, heads):
 # matched by shape, the same way get_albums() discovers the one it needs.
 # sqlite_stat* is included because the query planner reads it when choosing an
 # index: if it exists and its pages are missing, every query fails.
-WANTED_EXACT = ("ZASSET", "ZGENERICALBUM")
+#
+# ZADDITIONALASSETATTRIBUTES is here for one column: on an iOS 17/18-era
+# library it is the only place an asset's byte size is recorded, and that size
+# is what lets extract() skip an asset already on disk without asking the
+# device (see asset_size_select in extract_photos.py). It is not free -- its
+# b-trees roughly double the page-selective copy, from ~9% of the file to
+# ~18% -- but it buys back the two AFC round-trips per skipped asset that
+# candidate_remote() would otherwise spend, which is the larger cost on any
+# collection of more than a few dozen assets.
+WANTED_EXACT = ("ZASSET", "ZGENERICALBUM", "ZADDITIONALASSETATTRIBUTES")
 WANTED_PATTERNS = (re.compile(r"Z_\d+[A-Z]*ASSETS\Z"),
                    re.compile(r"sqlite_stat\d*\Z"))
 

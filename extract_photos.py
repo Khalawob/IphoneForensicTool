@@ -28,20 +28,30 @@ Other useful commands:
     python extract_photos.py --media-type videos           # extract one collection
     python extract_photos.py --preview --media-type screenshots
     python extract_photos.py --refresh-db  # force a re-pull of Photos.sqlite
+    python extract_photos.py --force       # re-pull assets already extracted
     python extract_photos.py --partial-db  # transfer only the DB pages needed
 
 THE --partial-db FAST PATH
 --------------------------
 By default the whole photo-library DB is pulled (~129MB on a 3,000-asset
 library), which dominates a wireless run. --partial-db instead transfers only
-the Photos.sqlite pages the queries actually read -- the ZASSET and album
-b-trees and their indexes, a few percent of the file -- and reads them with
-ordinary SQL. It falls back to a full pull if that copy cannot be built, so
-it is always safe to pass. Combine it with any other command:
+the Photos.sqlite pages the queries actually read -- the ZASSET, album and
+asset-attribute b-trees and their indexes, under a fifth of the file -- and
+reads them with ordinary SQL. It falls back to a full pull if that copy
+cannot be built, so it is always safe to pass. Combine it with any other
+command:
 
     python extract_photos.py --wifi --partial-db --media-type videos
     python extract_photos.py --wifi --partial-db --list-media-types
 
+
+SKIPPING WHAT IS ALREADY HERE
+-----------------------------
+An extraction skips any asset whose file is already in the output directory at
+the size the library DB records for it -- a local stat(), with no device
+round-trip at all, so a re-run costs only the DB pull. Where the DB has no
+usable size column, or its size disagrees with the file on disk, the device is
+asked (one stat) before a transfer is spent. --force re-pulls everything.
 
 REQUIREMENTS FOR WIFI:
   * Phone and laptop on the SAME network/subnet (the protocol won't cross subnets).
@@ -276,13 +286,53 @@ async def device_session(use_wifi):
         await lockdown.close()
 
 
-def get_asset_paths(db_path, where=DEFAULT_WHERE):
-    """Return [(ZDIRECTORY, ZFILENAME), ...] for every asset matching 'where'."""
+# Columns that have held an asset's byte size directly on ZASSET across iOS
+# releases. Recent libraries have none of them and keep the size one table
+# over, on ZADDITIONALASSETATTRIBUTES -- see asset_size_select().
+SIZE_COLUMNS_ON_ASSET = ("ZFILESIZE", "ZADJUSTEDFILESIZE", "ZORIGINALFILESIZE")
+
+
+def table_columns(con, table):
+    """Return the set of column names on a table, empty if it is absent."""
+    try:
+        return {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def asset_size_select(con):
+    """Return a SELECT expression giving each asset's byte size, over ZASSET.
+
+    Where the size lives has moved: older libraries carry it on ZASSET itself,
+    while an iOS 17/18-era library has it only on ZADDITIONALASSETATTRIBUTES,
+    one row per asset. The fallback is a correlated subquery rather than a
+    join, so that the caller's FROM stays a bare ZASSET and every WHERE clause
+    in CATEGORIES keeps working unqualified. A library with neither gets NULL,
+    and the callers treat an unknown size as 'ask the device'.
+    """
+    cols = table_columns(con, "ZASSET")
+    for name in SIZE_COLUMNS_ON_ASSET:
+        if name in cols:
+            return name
+    extra = table_columns(con, "ZADDITIONALASSETATTRIBUTES")
+    if {"ZORIGINALFILESIZE", "ZASSET"} <= extra:
+        return ("(SELECT aaa.ZORIGINALFILESIZE "
+                "FROM ZADDITIONALASSETATTRIBUTES aaa "
+                "WHERE aaa.ZASSET = ZASSET.Z_PK)")
+    return "NULL"
+
+
+def get_asset_targets(db_path, where=DEFAULT_WHERE):
+    """Return [(ZDIRECTORY, ZFILENAME, size_or_None), ...] for matching assets.
+
+    The size is what extract() compares a local copy against to decide whether
+    an asset still has to be transferred, so it comes from the same DB pull
+    that produced the asset list -- no extra device traffic.
+    """
     con = open_db(db_path)
     try:
-        return con.execute(
-            f"SELECT ZDIRECTORY, ZFILENAME FROM ZASSET WHERE {where}"
-        ).fetchall()
+        select = f"ZDIRECTORY, ZFILENAME, {asset_size_select(con)}"
+        return con.execute(f"SELECT {select} FROM ZASSET WHERE {where}").fetchall()
     except sqlite3.OperationalError as e:
         print("schema differs on this iOS version:", e)
         return []
@@ -294,14 +344,8 @@ def get_asset_details(db_path, where=DEFAULT_WHERE):
     """Return dicts with directory, filename, date and size for matching assets."""
     con = open_db(db_path)
     try:
-        cols = {row[1] for row in con.execute("PRAGMA table_info(ZASSET)").fetchall()}
-        size_col = next(
-            (c for c in ("ZFILESIZE", "ZADJUSTEDFILESIZE", "ZORIGINALFILESIZE")
-             if c in cols), None
-        )
-        select = "ZDIRECTORY, ZFILENAME, ZDATECREATED"
-        if size_col:
-            select += f", {size_col}"
+        select = ("ZDIRECTORY, ZFILENAME, ZDATECREATED, "
+                  + asset_size_select(con))
         rows = con.execute(
             f"SELECT {select} FROM ZASSET WHERE {where} "
             "ORDER BY ZDATECREATED DESC"
@@ -476,7 +520,8 @@ async def preview(use_wifi, category=None, refresh_db=False, partial_db=False):
             discard_preview_dirs(tmp_dirs)
 
 
-async def extract(use_wifi, category=None, refresh_db=False, partial_db=False):
+async def extract(use_wifi, category=None, refresh_db=False, partial_db=False,
+                  force=False):
     async with device_session(use_wifi) as afc:
         # 1. Pull only the DB (+ WAL sidecars).
         db = await pull_library_db(afc, refresh_db, partial_db)
@@ -490,24 +535,41 @@ async def extract(use_wifi, category=None, refresh_db=False, partial_db=False):
             return
         where, label, out_dir = resolved
 
-        favs = get_asset_paths(db, where)
+        favs = get_asset_targets(db, where)
         print(f"{len(favs)} {label.lower()} recorded in the library.")
         if not favs:
             return
 
-        # 3. Pull only those files.
+        # 3. Pull only those files, and only the ones not already here.
         out_dir.mkdir(parents=True, exist_ok=True)
-        pulled, missing = 0, 0
-        for directory, filename in favs:
+        pulled, skipped, missing = 0, 0, 0
+        for directory, filename, size in favs:
+            local = out_dir / filename
+            # The size the DB already gave us is the cheapest check there is:
+            # an asset still on disk at that size costs no device traffic at
+            # all, not even the candidate_remote() probes below.
+            if (not force and size is not None and local.exists()
+                    and local.stat().st_size == size):
+                skipped += 1
+                continue
             remote = await candidate_remote(afc, directory, filename)
             if remote is None:
                 missing += 1
                 print(f"  not found on device: {directory}/{filename}")
                 continue
+            # Either the library has no size column, or the one it has
+            # disagrees with the file on disk. Being wrong in this direction
+            # is cheap: ask the device (one stat) rather than spend a
+            # transfer on a file that is already current.
+            if (not force and local.exists()
+                    and await file_is_current(afc, remote, local)):
+                skipped += 1
+                continue
             await afc.pull(remote, str(out_dir), ignore_errors=True)
             pulled += 1
 
         print(f"\npulled {pulled} {label.lower()} into {out_dir}"
+              + (f" ({skipped} already extracted)" if skipped else "")
               + (f" ({missing} not found)" if missing else ""))
 
 
@@ -659,7 +721,7 @@ def partial_db_is_usable(db):
             where = category_where(key, cols)
             if where is None:
                 continue
-            get_asset_paths(db, where)
+            get_asset_targets(db, where)
             get_asset_details(db, where)
         return True
     except sqlite3.DatabaseError as e:
@@ -905,8 +967,13 @@ def main():
                              "unchanged on the device")
     parser.add_argument("--partial-db", action="store_true",
                         help="transfer only the Photos.sqlite pages the "
-                             "queries touch (a few percent of the file) "
+                             "queries touch (under a fifth of the file) "
                              "instead of the whole database")
+    parser.add_argument("--force", action="store_true",
+                        help="re-pull every asset, even one already in the "
+                             "output directory at the size the library "
+                             "records (the cached database is separate -- "
+                             "see --refresh-db)")
     parser.add_argument("--media-type", metavar="KEY", choices=sorted(CATEGORIES),
                         help="target one collection instead of the default set; "
                              "keys: " + ", ".join(sorted(CATEGORIES)))
@@ -932,7 +999,8 @@ def main():
         asyncio.run(preview(args.wifi, args.media_type, args.refresh_db, args.partial_db))
         return
 
-    asyncio.run(extract(args.wifi, args.media_type, args.refresh_db, args.partial_db))
+    asyncio.run(extract(args.wifi, args.media_type, args.refresh_db,
+                        args.partial_db, args.force))
 
 
 if __name__ == "__main__":

@@ -53,7 +53,7 @@ Photos app.
 ## 3. WHERE-clause as the unit of composition
 
 Queries take a `where` string rather than a category or a filter object
-(`get_asset_paths`, `get_asset_details`, `count_categories`). `resolve_category()`
+(`get_asset_targets`, `get_asset_details`, `count_categories`). `resolve_category()`
 (`extract_photos.py:311`) is the single translation point from a CLI key to the
 `(where, label, out_dir)` triple that the read and write paths both consume, so
 `preview()` and `extract()` share identical selection semantics.
@@ -106,6 +106,23 @@ you need.** `extract()` (`extract_photos.py:400`) is numbered in the source as
 (1) pull the DB, (2) resolve the asset list from SQL, (3) pull just those
 files. This keeps a WiFi run viable instead of mirroring the whole library.
 
+**An asset already on disk is not transferred again.** `extract()` compares
+the local file's byte size against the size the library DB records for that
+asset (`asset_size_select()`), and skips it on a match — a local `stat()`, no
+device traffic at all, not even the `candidate_remote()` probes below. Where
+the DB has no size, or its size disagrees with the file on disk, the device is
+asked once via `file_is_current()` before a transfer is spent, so a wrong or
+missing size costs a round trip rather than a re-download. `--force` re-pulls
+regardless; it is independent of `--refresh-db`, which governs the DB.
+
+Where the size lives is itself version-dependent and worth knowing:
+`ZASSET.ZFILESIZE` and friends are absent on an iOS 17/18-era library, which
+records it only on `ZADDITIONALASSETATTRIBUTES`. `asset_size_select()` returns
+a correlated subquery for that case rather than a join, so the callers' `FROM`
+stays a bare `ZASSET` and every `CATEGORIES` predicate keeps working
+unqualified. That table is in `want_tables()` for this one column, and it is
+the reason the page-selective copy grew (§6b).
+
 `candidate_remote()` (`extract_photos.py:279`) absorbs the one path ambiguity:
 AFC exposes assets at either `/{ZDIRECTORY}/{ZFILENAME}` or under a `DCIM/`
 prefix, so it probes both with `afc.exists()` and returns `None` if neither
@@ -146,8 +163,8 @@ misreport its contents.
 Caching (§6a) does nothing for the first run after the library changes: iOS
 checkpoints, `Photos.sqlite` differs, and all ~129MB comes down again at the
 measured ~3.8MB/s. But the tool's queries only ever read `ZASSET`,
-`ZGENERICALBUM`, the album↔asset join tables and `sqlite_master` — under 5% of
-the file. The bulk is `ACHANGE` (the iCloud sync log), `ZSCENECLASSIFICATION`
+`ZADDITIONALASSETATTRIBUTES`, `ZGENERICALBUM`, the album↔asset join tables and
+`sqlite_master` — about a ninth of the file. The bulk is `ACHANGE` (the iCloud sync log), `ZSCENECLASSIFICATION`
 and `ATRANSACTION`, which are never touched.
 
 So `--partial-db` transfers **pages instead of the file**. `sqlite_pages.py`
@@ -162,22 +179,24 @@ nothing about any of it.
 page-selective copy is `database disk image is malformed` when SQLite reaches
 a page that was never fetched — a fault we cannot satisfy after the fact. So
 nothing is predicted. `want_tables()` names the tables the tool queries, and
-*every* b-tree belonging to them is walked in full, including all 91 indexes
-on `ZASSET`. The planner is then free to pick any index it likes. Trying to
+*every* b-tree belonging to them is walked in full — 164 b-trees, including
+all 91 indexes on `ZASSET`. The planner is then free to pick any index it likes. Trying to
 include only the indexes the current predicates use would reintroduce exactly
 the guesswork this avoids.
 
 **Why the walk is breadth-first across all b-trees at once.** An interior page
 names all its children, so a whole level is known before any of it is fetched.
-Doing all 140 b-trees in lockstep puts hundreds of scattered page numbers in
+Doing all 164 b-trees in lockstep puts hundreds of scattered page numbers in
 front of the coalescer simultaneously; doing them one after another gives it
-almost nothing. Measured: 1,431 round trips versus 577 for the identical
-page set.
+almost nothing. Measured on the earlier three-table set: 1,431 round trips
+versus 577 for the identical page set.
 
 **`READ_GAP_PAGES` trades bytes for round trips.** The needed pages are
-scattered over ~964 runs, so one read per run means ~964 round trips.
-Bridging holes up to 8 pages costs 11.4MB instead of 6.2MB but drops to 577
-reads. The measured curve is in the `sqlite_pages` module docstring; retune
+scattered over ~1,860 runs, so one read per run means ~2,035 round trips.
+Bridging holes up to 8 pages costs 24.5MB instead of 15.4MB but drops to
+1,215 reads. The curve moved when `ZADDITIONALASSETATTRIBUTES` joined
+`want_tables()` (6.2MB/577 reads before), and 8 is still near the knee —
+retune only against a fresh measurement. The measured curve is in the `sqlite_pages` module docstring; retune
 against it rather than guessing.
 
 **Two stages, because of a chicken-and-egg.** Root pages live in
@@ -196,8 +215,9 @@ works on it unchanged.
 
 **The fallback is the safety net, and it is a real one.**
 `partial_db_is_usable()` runs every query the tool can issue — every
-`CATEGORIES` predicate, both asset-list queries per category, the album join,
-the distribution — before the run proceeds. `sqlite3` reports corruption as
+`CATEGORIES` predicate, both asset-list queries per category (which is why
+`get_asset_targets()` is in the probe: it is the query that reaches
+`ZADDITIONALASSETATTRIBUTES`), the album join, the distribution — before the run proceeds. `sqlite3` reports corruption as
 `DatabaseError`, *not* the `OperationalError` the query sites catch for schema
 differences, so a missing page propagates to the probe instead of being
 swallowed as `n/a`. If anything fails, `pull_library_db()` prints why and
@@ -221,7 +241,7 @@ query against the full file.
 
 ## 7. Presentation separated from retrieval
 
-Data functions return plain Python — lists of tuples (`get_asset_paths`), lists
+Data functions return plain Python — lists of tuples (`get_asset_targets`), lists
 of dicts (`get_asset_details`, `get_albums`), or `(key, label, count)` triples
 (`count_categories`) — and never print results. Printing lives in dedicated
 helpers that take those structures: `print_category_table()`

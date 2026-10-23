@@ -67,12 +67,15 @@ python extract_photos.py
 # Extract over WiFi
 python extract_photos.py --wifi
 
-# Transfer only the Photos.sqlite pages the queries read (~9% of the file)
+# Transfer only the Photos.sqlite pages the queries read (~18% of the file)
 python extract_photos.py --wifi --partial-db
 
 # Target one collection; keys come from CATEGORIES
 python extract_photos.py --media-type videos
 python extract_photos.py --media-type screenshots --wifi
+
+# Assets already in the output directory are skipped; --force re-pulls them
+python extract_photos.py --media-type videos --force
 
 # Inspect the library without downloading
 python extract_photos.py --list-albums
