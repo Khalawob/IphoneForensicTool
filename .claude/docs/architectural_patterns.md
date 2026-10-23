@@ -112,6 +112,35 @@ prefix, so it probes both with `afc.exists()` and returns `None` if neither
 resolves. Pulls pass `ignore_errors=True` and the caller tallies
 `pulled`/`missing` rather than aborting the run on one bad asset.
 
+## 6a. The pulled DB is cached, and must be opened read-only
+
+`pull_library_db()` compares each of `DB_FILES` against the device with
+`file_is_current()` -- size plus the device's `st_mtime`, which needs no extra
+bookkeeping because `afc.pull()` stamps every local file with the device's
+timestamp. Files that match are reused; only the rest are pulled.
+`--refresh-db` forces the transfer. The check is per file because iOS writes to
+`Photos.sqlite-wal` constantly while `Photos.sqlite` changes only on
+checkpoint: an all-or-nothing check would re-pull ~129MB for the sake of a few
+MB of journal. Mixing a cached file with a freshly pulled one is safe -- what
+lands on disk is byte-identical to the set now on the device, which is all
+SQLite requires.
+
+Two consequences follow, and both are load-bearing:
+
+- **Every query must go through `open_db()`**, which opens `mode=ro`. A normal
+  `sqlite3.connect()` checkpoints the WAL into `Photos.sqlite` and deletes the
+  sidecars when the last connection closes. That rewrites the files the cache
+  compares against, so the cache never hits -- and the local DB stops matching
+  the device byte for byte. Do not use `immutable=1`: it skips the WAL, which
+  silently hides every asset added since the last checkpoint.
+- **`Photos.sqlite-shm` is never cached.** It is a derived index that SQLite
+  recreates on open, so its timestamps never match the device's. It is 32KB,
+  so `pull_library_db()` simply re-pulls it every run.
+
+Local files absent on the device are deleted rather than left in place: a
+leftover `-wal` from an earlier run would be read as part of the database and
+misreport its contents.
+
 ## 7. Presentation separated from retrieval
 
 Data functions return plain Python — lists of tuples (`get_asset_paths`), lists

@@ -27,6 +27,7 @@ Other useful commands:
     python extract_photos.py --list-media-types # media types / utilities + counts
     python extract_photos.py --media-type videos           # extract one collection
     python extract_photos.py --preview --media-type screenshots
+    python extract_photos.py --refresh-db  # force a re-pull of Photos.sqlite
     
 REQUIREMENTS FOR WIFI:
   * Phone and laptop on the SAME network/subnet (the protocol won't cross subnets).
@@ -38,6 +39,7 @@ REQUIREMENTS FOR WIFI:
 
 import argparse
 import asyncio
+import contextlib
 import os
 import re
 import sqlite3
@@ -45,11 +47,16 @@ import tempfile
 from pathlib import Path
 
 from pymobiledevice3.lockdown import create_using_usbmux
-from pymobiledevice3.exceptions import NoDeviceConnectedError
+from pymobiledevice3.exceptions import AfcException, NoDeviceConnectedError
 from pymobiledevice3.osu.os_utils import get_os_utils
 
 DEST = Path("iphone_extract")
 FAVS_DIR = DEST / "favourites"
+
+# The photo-library DB and its WAL sidecars. Each is cached and pulled
+# independently -- see pull_library_db. The DB must only ever be opened
+# read-only (see open_db) or SQLite rewrites these files and breaks the cache.
+DB_FILES = ("Photos.sqlite", "Photos.sqlite-wal", "Photos.sqlite-shm")
 
 # Asset categories, mirroring the "Media Types" and "Utilities" sections of the
 # Photos app: key -> (label, columns it needs, SQL predicate over ZASSET).
@@ -93,9 +100,22 @@ UTILITY_KEYS = ("favourites", "hidden", "deleted", "imports", "duplicates")
 DEFAULT_WHERE = "ZFAVORITE = 1"
 
 
+def open_db(db_path):
+    """Open the pulled library DB read-only.
+
+    Read-only is not just caution. A normal open checkpoints the WAL into
+    Photos.sqlite and deletes the sidecars when the last connection closes,
+    rewriting the very files pull_library_db compares against the device --
+    which silently defeats the cache. mode=ro still reads through the WAL,
+    so assets added since the last checkpoint are visible; immutable=1 would
+    skip the WAL and hide them.
+    """
+    return sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+
+
 def asset_columns(db_path):
     """Return the set of column names present on ZASSET."""
-    con = sqlite3.connect(db_path)
+    con = open_db(db_path)
     try:
         return {row[1] for row in con.execute("PRAGMA table_info(ZASSET)")}
     except sqlite3.OperationalError:
@@ -121,7 +141,7 @@ def category_where(key, cols):
 def count_categories(db_path, keys):
     """Return [(label, count_or_None), ...] for the given category keys."""
     cols = asset_columns(db_path)
-    con = sqlite3.connect(db_path)
+    con = open_db(db_path)
     out = []
     try:
         for key in keys:
@@ -147,7 +167,7 @@ def kind_distribution(db_path):
     if not present:
         return [], []
     group = ", ".join(present)
-    con = sqlite3.connect(db_path)
+    con = open_db(db_path)
     try:
         rows = con.execute(
             f"SELECT {group}, COUNT(*) FROM ZASSET GROUP BY {group} "
@@ -169,16 +189,10 @@ def print_category_table(title, counted):
         print(f"{key:<20} {label:<20} {shown:>7}")
 
 
-async def list_media_types(use_wifi):
+async def list_media_types(use_wifi, refresh_db=False):
     """List media-type and utility collections with asset counts."""
-    from pymobiledevice3.services.afc import AfcService
-
-    lockdown = await connect(use_wifi)
-    print(f"connected to {lockdown.short_info.get('DeviceName', 'device')} "
-          f"({'WiFi' if use_wifi else 'USB'})")
-
-    async with AfcService(lockdown) as afc:
-        db = await pull_library_db(afc)
+    async with device_session(use_wifi) as afc:
+        db = await pull_library_db(afc, refresh_db)
         if db is None:
             print("Photos.sqlite not found -- cannot read media types.")
             return
@@ -219,9 +233,31 @@ async def connect(use_wifi):
         raise
 
 
+@contextlib.asynccontextmanager
+async def device_session(use_wifi):
+    """Connect, announce the device, and yield an AFC session.
+
+    Closing the lockdown connection is the point: without it the SSL transport
+    a WiFi connection sets up is torn down by the garbage collector after
+    asyncio.run() has already closed the event loop, which prints an alarming
+    (but harmless) 'Event loop is closed' traceback over real output.
+    """
+    # Imported here so the module loads even if AFC internals shift.
+    from pymobiledevice3.services.afc import AfcService
+
+    lockdown = await connect(use_wifi)
+    print(f"connected to {lockdown.short_info.get('DeviceName', 'device')} "
+          f"({'WiFi' if use_wifi else 'USB'})")
+    try:
+        async with AfcService(lockdown) as afc:
+            yield afc
+    finally:
+        await lockdown.close()
+
+
 def get_asset_paths(db_path, where=DEFAULT_WHERE):
     """Return [(ZDIRECTORY, ZFILENAME), ...] for every asset matching 'where'."""
-    con = sqlite3.connect(db_path)
+    con = open_db(db_path)
     try:
         return con.execute(
             f"SELECT ZDIRECTORY, ZFILENAME FROM ZASSET WHERE {where}"
@@ -235,7 +271,7 @@ def get_asset_paths(db_path, where=DEFAULT_WHERE):
 
 def get_asset_details(db_path, where=DEFAULT_WHERE):
     """Return dicts with directory, filename, date and size for matching assets."""
-    con = sqlite3.connect(db_path)
+    con = open_db(db_path)
     try:
         cols = {row[1] for row in con.execute("PRAGMA table_info(ZASSET)").fetchall()}
         size_col = next(
@@ -322,15 +358,34 @@ def resolve_category(db, category):
     return where, CATEGORIES[category][0], DEST / category
 
 
-async def preview(use_wifi, category=None):
-    from pymobiledevice3.services.afc import AfcService
+def discard_preview_dirs(tmp_dirs):
+    """Remove the temp dirs used for previews, tolerating files still in use.
 
-    lockdown = await connect(use_wifi)
-    print(f"connected to {lockdown.short_info.get('DeviceName', 'device')} "
-          f"({'WiFi' if use_wifi else 'USB'})")
+    os.startfile() hands each file to an external viewer and returns at once,
+    so deletion waits until the preview session ends. A file a viewer still
+    holds open cannot be removed on Windows; it is left in %TEMP% rather than
+    failing the run.
+    """
+    stuck = 0
+    for tmp_dir in tmp_dirs:
+        tmp_dir = Path(tmp_dir)
+        try:
+            for f in tmp_dir.iterdir():
+                try:
+                    f.unlink()
+                except OSError:
+                    stuck += 1
+            tmp_dir.rmdir()
+        except OSError:
+            pass
+    if stuck:
+        print(f"{stuck} preview file(s) were still open in a viewer; "
+              f"left behind in {tempfile.gettempdir()}.")
 
-    async with AfcService(lockdown) as afc:
-        db = await pull_library_db(afc)
+
+async def preview(use_wifi, category=None, refresh_db=False):
+    async with device_session(use_wifi) as afc:
+        db = await pull_library_db(afc, refresh_db)
         if db is None:
             print("Photos.sqlite not found -- cannot determine favourites.")
             return
@@ -348,66 +403,62 @@ async def preview(use_wifi, category=None):
 
         format_listing(details)
 
-        while True:
-            sel = input("Enter photo numbers to preview (e.g. 1,3,5-7), "
-                        "'a' for all, or 'q' to quit: ").strip().lower()
-            if sel == "q":
-                return
-            if sel == "a":
-                chosen = list(range(len(details)))
-            else:
-                chosen = parse_selection(sel, len(details))
-            if not chosen:
-                print("No valid selection. Try again.")
-                continue
-
-            tmp_dir = tempfile.mkdtemp(prefix="iphone_preview_")
-            opened = []
-            for idx in chosen:
-                item = details[idx]
-                remote = await candidate_remote(afc, item["directory"], item["filename"])
-                if remote is None:
-                    print(f"  not found on device: {item['filename']}")
-                    continue
-                await afc.pull(remote, tmp_dir, ignore_errors=True)
-                local = Path(tmp_dir) / item["filename"]
-                if local.exists():
-                    os.startfile(str(local))
-                    opened.append(local)
-                    print(f"  opened: {item['filename']}")
+        # Previewed files are deleted only when the session ends: the viewer
+        # os.startfile() launched may still be reading them.
+        tmp_dirs = []
+        try:
+            while True:
+                sel = input("Enter photo numbers to preview (e.g. 1,3,5-7), "
+                            "'a' for all, or 'q' to quit: ").strip().lower()
+                if sel == "q":
+                    return
+                if sel == "a":
+                    chosen = list(range(len(details)))
                 else:
-                    print(f"  failed to pull: {item['filename']}")
+                    chosen = parse_selection(sel, len(details))
+                if not chosen:
+                    print("No valid selection. Try again.")
+                    continue
 
-            if opened:
-                save = input("\nDownload these to disk? (y/n): ").strip().lower()
-                if save == "y":
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    import shutil
-                    for f in opened:
-                        shutil.copy2(str(f), str(out_dir / f.name))
-                    print(f"Saved {len(opened)} file(s) to {out_dir}")
+                tmp_dir = tempfile.mkdtemp(prefix="iphone_preview_")
+                tmp_dirs.append(tmp_dir)
+                opened = []
+                for idx in chosen:
+                    item = details[idx]
+                    remote = await candidate_remote(afc, item["directory"], item["filename"])
+                    if remote is None:
+                        print(f"  not found on device: {item['filename']}")
+                        continue
+                    await afc.pull(remote, tmp_dir, ignore_errors=True)
+                    local = Path(tmp_dir) / item["filename"]
+                    if local.exists():
+                        os.startfile(str(local))
+                        opened.append(local)
+                        print(f"  opened: {item['filename']}")
+                    else:
+                        print(f"  failed to pull: {item['filename']}")
 
-            for f in Path(tmp_dir).iterdir():
-                f.unlink(missing_ok=True)
-            Path(tmp_dir).rmdir()
+                if opened:
+                    save = input("\nDownload these to disk? (y/n): ").strip().lower()
+                    if save == "y":
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        import shutil
+                        for f in opened:
+                            shutil.copy2(str(f), str(out_dir / f.name))
+                        print(f"Saved {len(opened)} file(s) to {out_dir}")
 
-            another = input("Preview more? (y/n): ").strip().lower()
-            if another != "y":
-                return
-            format_listing(details)
+                another = input("Preview more? (y/n): ").strip().lower()
+                if another != "y":
+                    return
+                format_listing(details)
+        finally:
+            discard_preview_dirs(tmp_dirs)
 
 
-async def extract(use_wifi, category=None):
-    # Import here so the module loads even if AFC internals shift.
-    from pymobiledevice3.services.afc import AfcService
-
-    lockdown = await connect(use_wifi)
-    print(f"connected to {lockdown.short_info.get('DeviceName', 'device')} "
-          f"({'WiFi' if use_wifi else 'USB'})")
-
-    async with AfcService(lockdown) as afc:
+async def extract(use_wifi, category=None, refresh_db=False):
+    async with device_session(use_wifi) as afc:
         # 1. Pull only the DB (+ WAL sidecars).
-        db = await pull_library_db(afc)
+        db = await pull_library_db(afc, refresh_db)
         if db is None:
             print("Photos.sqlite not found -- cannot determine favourites.")
             return
@@ -450,7 +501,7 @@ def get_albums(db_path):
     version-specific number (Z_28ASSETS, Z_30ASSETS, ...), so it is discovered
     at runtime. If it cannot be found, a cached count column is used instead.
     """
-    con = sqlite3.connect(db_path)
+    con = open_db(db_path)
     try:
         cols = {row[1] for row in con.execute("PRAGMA table_info(ZGENERICALBUM)")}
         if not cols:
@@ -507,27 +558,64 @@ def get_albums(db_path):
     ]
 
 
-async def pull_library_db(afc):
-    """Pull Photos.sqlite (+ WAL sidecars) into DEST; return the DB path or None."""
+async def file_is_current(afc, remote, local):
+    """True if a local file still matches the device's, by size and mtime.
+
+    afc.pull() stamps each local file with the device's st_mtime, so the cached
+    copy already carries the device's own timestamps -- nothing extra to track.
+    """
+    if not local.exists():
+        return False
+    try:
+        info = await afc.stat(remote)
+    except AfcException:
+        return False
+    st = local.stat()
+    if st.st_size != info["st_size"]:
+        return False
+    # One second of slack: os.utime and the filesystem both round.
+    return abs(st.st_mtime - info["st_mtime"].timestamp()) <= 1
+
+
+async def pull_library_db(afc, refresh=False):
+    """Pull Photos.sqlite (+ WAL sidecars) into DEST; return the DB path or None.
+
+    The DB runs to hundreds of MB on a sizeable library and dominates the cost
+    of a wireless run, so each file is pulled only if it differs from the local
+    copy. Checking per file matters because iOS writes to the -wal constantly
+    while Photos.sqlite itself changes only on checkpoint: an all-or-nothing
+    check would re-pull the big file for the sake of a few MB of journal.
+    Mixing a cached file with a freshly pulled one is safe -- what lands on
+    disk is byte-identical to the set now on the device, which is the only
+    thing SQLite requires. Pass refresh=True to force every transfer.
+    """
     DEST.mkdir(exist_ok=True)
-    for name in ("Photos.sqlite", "Photos.sqlite-wal", "Photos.sqlite-shm"):
+    reused = []
+    for name in DB_FILES:
         remote = f"/PhotoData/{name}"
-        if await afc.exists(remote):
-            await afc.pull(remote, str(DEST), ignore_errors=True)
+        local = DEST / name
+        if not await afc.exists(remote):
+            if local.exists():
+                # A sidecar left over from an earlier pull would be read as
+                # part of this database and misreport its contents.
+                local.unlink()
+            continue
+        # The -shm is a derived index that SQLite recreates on open, so its
+        # timestamps never match the device's. It is 32 KB -- just re-pull it.
+        if name != "Photos.sqlite-shm" and not refresh                 and await file_is_current(afc, remote, local):
+            reused.append(f"{name} ({local.stat().st_size / 1048576:.0f} MB)")
+            continue
+        await afc.pull(remote, str(DEST), ignore_errors=True, progress_bar=True)
+    if reused:
+        print(f"unchanged on device, reused: {', '.join(reused)}")
     db = DEST / "Photos.sqlite"
     return db if db.exists() else None
 
 
-async def list_albums(use_wifi):
+async def list_albums(use_wifi, refresh_db=False):
     """List the album names on the device with their photo counts."""
-    from pymobiledevice3.services.afc import AfcService
-
-    lockdown = await connect(use_wifi)
-    print(f"connected to {lockdown.short_info.get('DeviceName', 'device')} "
-          f"({'WiFi' if use_wifi else 'USB'})")
-
-    async with AfcService(lockdown) as afc:
-        db = await pull_library_db(afc)
+    async with device_session(use_wifi) as afc:
+        db = await pull_library_db(afc, refresh_db)
         if db is None:
             print("Photos.sqlite not found -- cannot read albums.")
             return
@@ -654,6 +742,9 @@ def main():
                         help="list the album names on the device with photo counts")
     parser.add_argument("--list-media-types", action="store_true",
                         help="list media-type and utility collections with counts")
+    parser.add_argument("--refresh-db", action="store_true",
+                        help="re-pull Photos.sqlite even if the cached copy is "
+                             "unchanged on the device")
     parser.add_argument("--media-type", metavar="KEY", choices=sorted(CATEGORIES),
                         help="target one collection instead of the default set; "
                              "keys: " + ", ".join(sorted(CATEGORIES)))
@@ -668,18 +759,18 @@ def main():
         return
 
     if args.list_albums:
-        asyncio.run(list_albums(args.wifi))
+        asyncio.run(list_albums(args.wifi, args.refresh_db))
         return
 
     if args.list_media_types:
-        asyncio.run(list_media_types(args.wifi))
+        asyncio.run(list_media_types(args.wifi, args.refresh_db))
         return
 
     if args.preview:
-        asyncio.run(preview(args.wifi, args.media_type))
+        asyncio.run(preview(args.wifi, args.media_type, args.refresh_db))
         return
 
-    asyncio.run(extract(args.wifi, args.media_type))
+    asyncio.run(extract(args.wifi, args.media_type, args.refresh_db))
 
 
 if __name__ == "__main__":
