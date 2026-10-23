@@ -28,7 +28,21 @@ Other useful commands:
     python extract_photos.py --media-type videos           # extract one collection
     python extract_photos.py --preview --media-type screenshots
     python extract_photos.py --refresh-db  # force a re-pull of Photos.sqlite
-    
+    python extract_photos.py --partial-db  # transfer only the DB pages needed
+
+THE --partial-db FAST PATH
+--------------------------
+By default the whole photo-library DB is pulled (~129MB on a 3,000-asset
+library), which dominates a wireless run. --partial-db instead transfers only
+the Photos.sqlite pages the queries actually read -- the ZASSET and album
+b-trees and their indexes, a few percent of the file -- and reads them with
+ordinary SQL. It falls back to a full pull if that copy cannot be built, so
+it is always safe to pass. Combine it with any other command:
+
+    python extract_photos.py --wifi --partial-db --media-type videos
+    python extract_photos.py --wifi --partial-db --list-media-types
+
+
 REQUIREMENTS FOR WIFI:
   * Phone and laptop on the SAME network/subnet (the protocol won't cross subnets).
   * Phone connected to WiFi and UNLOCKED (media files seal when the device locks).
@@ -50,8 +64,15 @@ from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.exceptions import AfcException, NoDeviceConnectedError
 from pymobiledevice3.osu.os_utils import get_os_utils
 
+import sqlite_pages
+
 DEST = Path("iphone_extract")
 FAVS_DIR = DEST / "favourites"
+
+# A page-selective copy of the library DB lives in its own directory, so that
+# it can keep the sidecar names SQLite derives from the main filename without
+# ever colliding with -- or being mistaken for -- a fully pulled copy.
+PARTIAL_DEST = DEST / "partial"
 
 # The photo-library DB and its WAL sidecars. Each is cached and pulled
 # independently -- see pull_library_db. The DB must only ever be opened
@@ -189,10 +210,10 @@ def print_category_table(title, counted):
         print(f"{key:<20} {label:<20} {shown:>7}")
 
 
-async def list_media_types(use_wifi, refresh_db=False):
+async def list_media_types(use_wifi, refresh_db=False, partial_db=False):
     """List media-type and utility collections with asset counts."""
     async with device_session(use_wifi) as afc:
-        db = await pull_library_db(afc, refresh_db)
+        db = await pull_library_db(afc, refresh_db, partial_db)
         if db is None:
             print("Photos.sqlite not found -- cannot read media types.")
             return
@@ -383,9 +404,9 @@ def discard_preview_dirs(tmp_dirs):
               f"left behind in {tempfile.gettempdir()}.")
 
 
-async def preview(use_wifi, category=None, refresh_db=False):
+async def preview(use_wifi, category=None, refresh_db=False, partial_db=False):
     async with device_session(use_wifi) as afc:
-        db = await pull_library_db(afc, refresh_db)
+        db = await pull_library_db(afc, refresh_db, partial_db)
         if db is None:
             print("Photos.sqlite not found -- cannot determine favourites.")
             return
@@ -455,10 +476,10 @@ async def preview(use_wifi, category=None, refresh_db=False):
             discard_preview_dirs(tmp_dirs)
 
 
-async def extract(use_wifi, category=None, refresh_db=False):
+async def extract(use_wifi, category=None, refresh_db=False, partial_db=False):
     async with device_session(use_wifi) as afc:
         # 1. Pull only the DB (+ WAL sidecars).
-        db = await pull_library_db(afc, refresh_db)
+        db = await pull_library_db(afc, refresh_db, partial_db)
         if db is None:
             print("Photos.sqlite not found -- cannot determine favourites.")
             return
@@ -577,7 +598,133 @@ async def file_is_current(afc, remote, local):
     return abs(st.st_mtime - info["st_mtime"].timestamp()) <= 1
 
 
-async def pull_library_db(afc, refresh=False):
+@contextlib.asynccontextmanager
+async def afc_reader(afc, remote):
+    """Yield an async read(offset, length) over one file on the device.
+
+    This is the whole device side of the page-selective path: AFC exposes
+    fopen/fseek/fread/fclose, which is all sqlite_pages needs. fread returns
+    at most what the device feels like giving, so a short read is topped up
+    rather than treated as the end of the range.
+    """
+    handle = await sqlite_pages.maybe_await(afc.fopen, remote, "r")
+    try:
+        async def read(offset, length):
+            await sqlite_pages.maybe_await(afc.fseek, handle, offset, os.SEEK_SET)
+            chunks, got = [], 0
+            while got < length:
+                blob = await sqlite_pages.maybe_await(afc.fread, handle, length - got)
+                if not blob:
+                    break
+                chunks.append(blob)
+                got += len(blob)
+            return b"".join(chunks)
+
+        yield read
+    finally:
+        with contextlib.suppress(Exception):
+            await sqlite_pages.maybe_await(afc.fclose, handle)
+
+
+def partial_db_is_usable(db):
+    """Run every query a real run could make, to see if this copy answers them.
+
+    A page-selective copy fails by reporting 'database disk image is
+    malformed' at the instant SQLite reaches a page that was never fetched --
+    which would otherwise happen halfway through a run, after the user has
+    already waited. So every query shape is executed up front, against every
+    category, which is the entire space of queries the tool can issue: the
+    counts, the raw distribution, the album join, and both asset-list queries
+    for each supported category. All of it is local and takes milliseconds.
+
+    What this does and does not prove, measured rather than assumed: blanking
+    a page that some query reads is caught here. Blanking a page in the
+    fetched set that *no* query reads is not, and roughly half of the set is
+    in that position -- the copy deliberately includes all 91 ZASSET indexes
+    so the planner cannot pick one that is absent, while any single query
+    visits only one of them. That is the right trade: the check is as strong
+    as the run it is standing in for, and the surplus is what makes the copy
+    safe against a planner that chooses differently than it did here.
+
+    Note that sqlite3 raises corruption as DatabaseError, not the
+    OperationalError the query sites catch for schema differences, so a
+    missing page propagates here instead of being swallowed as 'n/a'.
+    """
+    try:
+        count_categories(db, tuple(CATEGORIES))
+        kind_distribution(db)
+        get_albums(db)
+        cols = asset_columns(db)
+        for key in CATEGORIES:
+            where = category_where(key, cols)
+            if where is None:
+                continue
+            get_asset_paths(db, where)
+            get_asset_details(db, where)
+        return True
+    except sqlite3.DatabaseError as e:
+        print(f"the page-selective copy does not answer the usual queries ({e}).")
+        return False
+
+
+async def pull_partial_library_db(afc, refresh=False):
+    """Build a page-selective copy of Photos.sqlite; return it, or None.
+
+    Returns None -- rather than raising -- if the copy cannot be built or does
+    not answer the tool's queries, so the caller can fall back to a full pull.
+    """
+    remote_db = "/PhotoData/Photos.sqlite"
+    if not await afc.exists(remote_db):
+        return None
+    PARTIAL_DEST.mkdir(parents=True, exist_ok=True)
+
+    # The WAL holds every change since the last checkpoint, so it is not
+    # optional -- but it is small (a few hundred KB to a few MB), so it is
+    # pulled whole, on the same per-file cache as the full path.
+    for name in DB_FILES[1:]:
+        remote = f"/PhotoData/{name}"
+        local = PARTIAL_DEST / name
+        if not await afc.exists(remote):
+            if local.exists():
+                local.unlink()
+            continue
+        if (name != "Photos.sqlite-shm" and not refresh
+                and await file_is_current(afc, remote, local)):
+            continue
+        await afc.pull(remote, str(PARTIAL_DEST), ignore_errors=True)
+
+    local_db = PARTIAL_DEST / "Photos.sqlite"
+    # The partial copy is written at the database's full length and stamped
+    # with the device's mtime, so file_is_current() recognises it as unchanged
+    # on a later run exactly as it does a fully pulled copy -- no extra
+    # bookkeeping, and the same --refresh-db override.
+    if not refresh and await file_is_current(afc, remote_db, local_db):
+        print("page-selective copy unchanged on device, reused")
+    else:
+        info = await afc.stat(remote_db)
+        print(f"building a page-selective copy of Photos.sqlite "
+              f"({info['st_size'] / 1048576:.0f} MB on device)...")
+        try:
+            async with afc_reader(afc, remote_db) as read:
+                stats = await sqlite_pages.build(
+                    read, local_db, info["st_size"], open_db)
+        except (sqlite_pages.MalformedDatabase, AfcException,
+                sqlite3.DatabaseError, OSError) as e:
+            print(f"could not build a page-selective copy: {e}")
+            return None
+        stamp = info["st_mtime"].timestamp()
+        os.utime(local_db, (stamp, stamp))
+        print(f"  kept {stats['pages']} of {stats['page_count']} pages "
+              f"({stats['btrees']} b-trees across {stats['tables']} tables)")
+        print(f"  transferred {stats['fetched_bytes'] / 1048576:.1f} MB of "
+              f"{stats['total_bytes'] / 1048576:.1f} MB "
+              f"({100 * stats['fetched_bytes'] / stats['total_bytes']:.1f}%) "
+              f"in {stats['reads']} ranged reads")
+
+    return local_db if partial_db_is_usable(local_db) else None
+
+
+async def pull_library_db(afc, refresh=False, partial=False):
     """Pull Photos.sqlite (+ WAL sidecars) into DEST; return the DB path or None.
 
     The DB runs to hundreds of MB on a sizeable library and dominates the cost
@@ -588,7 +735,18 @@ async def pull_library_db(afc, refresh=False):
     Mixing a cached file with a freshly pulled one is safe -- what lands on
     disk is byte-identical to the set now on the device, which is the only
     thing SQLite requires. Pass refresh=True to force every transfer.
+
+    Pass partial=True to transfer only the pages the tool's queries touch --
+    a few percent of the file (see sqlite_pages). That path falls back here if
+    the page-selective copy cannot be built or does not answer the queries, so
+    a run never fails for want of a page.
     """
+    if partial:
+        db = await pull_partial_library_db(afc, refresh)
+        if db is not None:
+            return db
+        print("falling back to a full pull of Photos.sqlite.")
+
     DEST.mkdir(exist_ok=True)
     reused = []
     for name in DB_FILES:
@@ -612,10 +770,10 @@ async def pull_library_db(afc, refresh=False):
     return db if db.exists() else None
 
 
-async def list_albums(use_wifi, refresh_db=False):
+async def list_albums(use_wifi, refresh_db=False, partial_db=False):
     """List the album names on the device with their photo counts."""
     async with device_session(use_wifi) as afc:
-        db = await pull_library_db(afc, refresh_db)
+        db = await pull_library_db(afc, refresh_db, partial_db)
         if db is None:
             print("Photos.sqlite not found -- cannot read albums.")
             return
@@ -745,6 +903,10 @@ def main():
     parser.add_argument("--refresh-db", action="store_true",
                         help="re-pull Photos.sqlite even if the cached copy is "
                              "unchanged on the device")
+    parser.add_argument("--partial-db", action="store_true",
+                        help="transfer only the Photos.sqlite pages the "
+                             "queries touch (a few percent of the file) "
+                             "instead of the whole database")
     parser.add_argument("--media-type", metavar="KEY", choices=sorted(CATEGORIES),
                         help="target one collection instead of the default set; "
                              "keys: " + ", ".join(sorted(CATEGORIES)))
@@ -759,18 +921,18 @@ def main():
         return
 
     if args.list_albums:
-        asyncio.run(list_albums(args.wifi, args.refresh_db))
+        asyncio.run(list_albums(args.wifi, args.refresh_db, args.partial_db))
         return
 
     if args.list_media_types:
-        asyncio.run(list_media_types(args.wifi, args.refresh_db))
+        asyncio.run(list_media_types(args.wifi, args.refresh_db, args.partial_db))
         return
 
     if args.preview:
-        asyncio.run(preview(args.wifi, args.media_type, args.refresh_db))
+        asyncio.run(preview(args.wifi, args.media_type, args.refresh_db, args.partial_db))
         return
 
-    asyncio.run(extract(args.wifi, args.media_type, args.refresh_db))
+    asyncio.run(extract(args.wifi, args.media_type, args.refresh_db, args.partial_db))
 
 
 if __name__ == "__main__":

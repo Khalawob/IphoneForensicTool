@@ -141,6 +141,84 @@ Local files absent on the device are deleted rather than left in place: a
 leftover `-wal` from an earlier run would be read as part of the database and
 misreport its contents.
 
+## 6b. The page-selective DB copy (`--partial-db`)
+
+Caching (§6a) does nothing for the first run after the library changes: iOS
+checkpoints, `Photos.sqlite` differs, and all ~129MB comes down again at the
+measured ~3.8MB/s. But the tool's queries only ever read `ZASSET`,
+`ZGENERICALBUM`, the album↔asset join tables and `sqlite_master` — under 5% of
+the file. The bulk is `ACHANGE` (the iCloud sync log), `ZSCENECLASSIFICATION`
+and `ATRANSACTION`, which are never touched.
+
+So `--partial-db` transfers **pages instead of the file**. `sqlite_pages.py`
+walks the SQLite file format over AFC's ranged reads (`fseek`/`fread`,
+wrapped by `afc_reader()`), collects every page of the relevant b-trees, and
+writes them into a local file of the database's full length with zeros in the
+holes. Stock `sqlite3` then opens that file and the existing queries run
+unchanged — `CATEGORIES`, WHERE-clause composition and `open_db()` know
+nothing about any of it.
+
+**Correct by enumeration, not by prediction.** The failure mode of a
+page-selective copy is `database disk image is malformed` when SQLite reaches
+a page that was never fetched — a fault we cannot satisfy after the fact. So
+nothing is predicted. `want_tables()` names the tables the tool queries, and
+*every* b-tree belonging to them is walked in full, including all 91 indexes
+on `ZASSET`. The planner is then free to pick any index it likes. Trying to
+include only the indexes the current predicates use would reintroduce exactly
+the guesswork this avoids.
+
+**Why the walk is breadth-first across all b-trees at once.** An interior page
+names all its children, so a whole level is known before any of it is fetched.
+Doing all 140 b-trees in lockstep puts hundreds of scattered page numbers in
+front of the coalescer simultaneously; doing them one after another gives it
+almost nothing. Measured: 1,431 round trips versus 577 for the identical
+page set.
+
+**`READ_GAP_PAGES` trades bytes for round trips.** The needed pages are
+scattered over ~964 runs, so one read per run means ~964 round trips.
+Bridging holes up to 8 pages costs 11.4MB instead of 6.2MB but drops to 577
+reads. The measured curve is in the `sqlite_pages` module docstring; retune
+against it rather than guessing.
+
+**Two stages, because of a chicken-and-egg.** Root pages live in
+`sqlite_master`, which is itself a b-tree. Stage one fetches only that b-tree
+(37 pages), which makes the partial file readable enough that `sqlite3` can
+decode the schema — much better than hand-rolling a record parser over Apple's
+496-object, 97KB DDL. Stage two walks what it named.
+
+**Coexistence with the full cache.** The partial copy lives in its own
+directory (`iphone_extract/partial/`) so it can keep the sidecar names SQLite
+derives from the main filename without ever being confused with a fully pulled
+copy. It is written at the database's full length and stamped with the
+device's mtime, so `file_is_current()` recognises it as unchanged on a later
+run exactly as it does a full copy — no new bookkeeping, and `--refresh-db`
+works on it unchanged.
+
+**The fallback is the safety net, and it is a real one.**
+`partial_db_is_usable()` runs every query the tool can issue — every
+`CATEGORIES` predicate, both asset-list queries per category, the album join,
+the distribution — before the run proceeds. `sqlite3` reports corruption as
+`DatabaseError`, *not* the `OperationalError` the query sites catch for schema
+differences, so a missing page propagates to the probe instead of being
+swallowed as `n/a`. If anything fails, `pull_library_db()` prints why and
+falls back to a full pull, so a run never fails for want of a page. Measured
+limit of the probe: it catches a blanked page that some query reads, but about
+half the fetched set is read by no query (the other 90 indexes), and blanking
+one of those is not detected. That is the intended shape — the probe is as
+strong as the run it stands in for, and the surplus is what protects against a
+planner that chooses differently.
+
+**The remote file is untrusted.** `sqlite_pages` bounds b-tree depth, page
+numbers, cell pointers and overflow chains, and raises `MalformedDatabase` on
+anything structurally impossible, which the caller turns into a fallback
+rather than a traceback.
+
+**This module is testable without a phone** — the one part of the device path
+that is. It depends on nothing but an async `read(offset, length)` callable,
+and `local_reader()` supplies one over a local file, so the walk can be
+validated by building a copy from a real `Photos.sqlite` and diffing every
+query against the full file.
+
 ## 7. Presentation separated from retrieval
 
 Data functions return plain Python — lists of tuples (`get_asset_paths`), lists

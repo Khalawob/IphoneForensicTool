@@ -3,3 +3,6 @@ iphone_extract/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Byte-code caches (a second module means these now appear)
+__pycache__/

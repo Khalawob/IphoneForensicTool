@@ -24,27 +24,34 @@ utilities (favourites, hidden, recently deleted, duplicates, …).
 - No third-party deps beyond pymobiledevice3; no requirements file, no tests,
   no build step.
 
-**Windows-only** in one place: `--preview` opens files with `os.startfile()`
-(`extract_photos.py:375`).
+**Windows-only** in one place: `--preview` opens files with `os.startfile()`.
 
 ## Structure
 
-Single-module project — there is no package layout.
+Two flat modules, no package layout.
 
 | Path | Purpose |
 |---|---|
-| `extract_photos.py` | The entire tool: CLI, device connection, SQL queries, transfer. The module docstring (`:1-37`) is the user-facing usage reference. |
+| `extract_photos.py` | The tool: CLI, device connection, SQL queries, transfer. The module docstring is the user-facing usage reference. |
+| `sqlite_pages.py` | SQLite file-format reader behind `--partial-db`: walks b-trees over a ranged reader and builds a page-selective local copy. No device dependency, so it is verifiable offline. |
 | `iphone_extract/` | Output directory, created at runtime. Holds the pulled `Photos.sqlite` plus one subdirectory per extracted collection. **Gitignored** — personal data, large. |
 | `.claude/docs/` | Extended documentation for Claude (see below) |
 
 Key landmarks in `extract_photos.py`:
 
-- `CATEGORIES` (`:60`) — the declarative table of every extractable collection
-- `main()` (`:642`) — argparse setup and command dispatch
-- `connect()` (`:206`) — the single USB/WiFi connection point
-- `pull_library_db()` (`:510`) — pulls `Photos.sqlite` (+ WAL sidecars)
-- `extract()` (`:400`) / `preview()` (`:325`) — the two output paths
-- `setup_wifi()` (`:549`) — one-time pairing + WiFi enablement
+- `CATEGORIES` — the declarative table of every extractable collection
+- `main()` — argparse setup and command dispatch
+- `connect()` — the single USB/WiFi connection point
+- `pull_library_db()` — pulls `Photos.sqlite` (+ WAL sidecars), or dispatches
+  to the page-selective path and falls back here if it does not work out
+- `pull_partial_library_db()` / `afc_reader()` / `partial_db_is_usable()` —
+  the `--partial-db` path and its fallback guard
+- `extract()` / `preview()` — the two output paths
+- `setup_wifi()` — one-time pairing + WiFi enablement
+
+In `sqlite_pages.py`: `build()` is the entry point, `btree_pages()` the walk,
+`want_tables()` the list of tables made local, `local_reader()` the offline
+test harness.
 
 ## Commands
 
@@ -59,6 +66,9 @@ python extract_photos.py
 
 # Extract over WiFi
 python extract_photos.py --wifi
+
+# Transfer only the Photos.sqlite pages the queries read (~9% of the file)
+python extract_photos.py --wifi --partial-db
 
 # Target one collection; keys come from CATEGORIES
 python extract_photos.py --media-type videos
@@ -94,9 +104,15 @@ WiFi requires: phone and laptop on the **same subnet**, phone on WiFi and
 - **Never assume the SQLite schema.** Apple's `Photos.sqlite` layout shifts
   between iOS versions. Introspect with `PRAGMA table_info`, guard every query,
   and degrade to `None`/`n/a` rather than raising. See the patterns doc.
-- **Adding a collection** means adding one row to `CATEGORIES` (`:60`) and
-  nothing else.
-- **Keep the module docstring current** (`:1-37`) — it is the only user docs;
+- **Adding a collection** means adding one row to `CATEGORIES` and nothing
+  else. But if it queries a *table* the tool has not touched before, add that
+  table to `want_tables()` in `sqlite_pages.py` too, or `--partial-db` will not
+  have its pages. The fallback catches the mistake; it does not fix it.
+- **`sqlite_pages.py` can be tested without a phone.** It reads through an
+  async `read(offset, length)` callable, and `local_reader()` supplies one over
+  a local file, so a change to the walk can be validated against a real
+  `Photos.sqlite` by diffing query results against the full file.
+- **Keep the module docstring current** — it is the only user docs;
   new flags belong in its USAGE section and in `argparse` help.
 - **Never commit anything under `iphone_extract/`.** It contains personal
   photos and a copy of the photo database. `.gitignore` covers it and `*.sqlite`.
@@ -112,7 +128,7 @@ Check these when the work touches their topic:
 - **`.claude/docs/architectural_patterns.md`** — the recurring patterns and
   design decisions: schema-defensive SQL, the declarative `CATEGORIES` table,
   WHERE-clause composition, command dispatch, connection/AFC lifecycle and
-  lazy imports, DB-first minimal transfer, data/presentation separation, the
-  interactive preview loop, verify-with-retry after device state changes, and
-  error-message style. **Read before adding a command, a category, or any new
-  query.**
+  lazy imports, DB-first minimal transfer, the cached and page-selective DB
+  copies (§6a, §6b), data/presentation separation, the interactive preview
+  loop, verify-with-retry after device state changes, and error-message style.
+  **Read before adding a command, a category, or any new query.**
