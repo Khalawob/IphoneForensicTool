@@ -90,7 +90,7 @@ MEDIA_TYPE_KEYS = ("photos", "videos", "live", "animated", "screenshots",
 UTILITY_KEYS = ("favourites", "hidden", "deleted", "imports", "duplicates")
 
 # What the extractor pulls when no category is named (the original behaviour).
-DEFAULT_WHERE = "ZHIDDEN = 1"
+DEFAULT_WHERE = "ZFAVORITE = 1"
 
 
 def asset_columns(db_path):
